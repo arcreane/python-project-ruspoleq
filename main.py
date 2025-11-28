@@ -1,10 +1,10 @@
-from math import sin, cos, radians, sqrt
+from math import sin, cos, radians, sqrt, atan2, degrees
 import random
 import sys
 from PySide6.QtCore import (QPointF, QRectF, Qt, QTimer, QPropertyAnimation,
                             QEasingCurve, Property, QAbstractAnimation)
 from PySide6.QtGui import (QBrush, QColor, QPainter, QPainterPath, QPen,
-                           QLinearGradient, QRadialGradient, QFont)
+                           QLinearGradient, QRadialGradient, QFont, QPolygonF)
 from PySide6.QtWidgets import (QApplication, QGraphicsItem, QGraphicsScene,
                                QGraphicsView, QHBoxLayout, QLabel, QVBoxLayout,
                                QWidget, QPushButton, QFormLayout, QSpinBox,
@@ -17,6 +17,7 @@ UPDATE_INTERVAL_MS = 40
 SWEEP_SPEED_DEG_PER_SEC = 90
 PROXIMITY_THRESHOLD = 30
 LANDING_ZONE_SIZE = 80
+TARGET_PLANE_COUNT = 5
 
 
 # Fonctions utilitaires
@@ -29,6 +30,61 @@ def project_move(x, y, heading_deg, distance):
 
 def distance(a: QPointF, b: QPointF):
     return sqrt((a.x() - b.x()) ** 2 + (a.y() - b.y()) ** 2)
+
+
+# ---- Orage ----
+class StormItem(QGraphicsItem):
+    def __init__(self, x, y):
+        super().__init__()
+        self.setPos(x, y)
+        self.animation_phase = 0
+        self.radius = 60
+        self.strength = random.uniform(0.7, 1.0)
+
+    def boundingRect(self) -> QRectF:
+        r = self.radius + 20
+        return QRectF(-r, -r, r * 2, r * 2)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        # Animation de pulsation
+        self.animation_phase = (self.animation_phase + 0.15) % 6.28
+        pulse = 1.0 + 0.3 * sin(self.animation_phase)
+        current_radius = self.radius * pulse
+
+        # Nuage d'orage avec dégradé
+        gradient = QRadialGradient(0, 0, current_radius)
+        gradient.setColorAt(0, QColor(80, 80, 100, 150))
+        gradient.setColorAt(0.5, QColor(50, 50, 70, 120))
+        gradient.setColorAt(1, QColor(30, 30, 50, 0))
+
+        painter.setBrush(QBrush(gradient))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(QPointF(0, 0), current_radius, current_radius)
+
+        # Éclairs aléatoires
+        if random.random() < 0.1:
+            painter.setPen(QPen(QColor(255, 255, 100, 200), 3))
+            for _ in range(3):
+                angle = random.uniform(0, 360)
+                length = random.uniform(20, 40)
+                x1 = cos(radians(angle)) * 10
+                y1 = sin(radians(angle)) * 10
+                x2 = cos(radians(angle)) * length
+                y2 = sin(radians(angle)) * length
+                painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+        # Symbole d'avertissement
+        painter.setPen(QPen(QColor(255, 200, 0), 2))
+        font = QFont("Arial", 20, QFont.Bold)
+        painter.setFont(font)
+        painter.drawText(QRectF(-15, -15, 30, 30), Qt.AlignCenter, "⚡")
+
+    def affects_plane(self, plane_pos: QPointF):
+        """Vérifie si un avion est dans la zone d'effet de l'orage"""
+        d = distance(self.pos(), plane_pos)
+        return d < self.radius
 
 
 # ---- Zone d'atterrissage ----
@@ -78,6 +134,8 @@ class PlaneItem(QGraphicsItem):
         self.warning = False
         self.pulse_phase = 0
         self.scale_m_per_pixel = 10
+        self.landing_mode = False
+        self.in_storm = False
 
         self.setFlag(QGraphicsItem.ItemIsSelectable)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges)
@@ -108,10 +166,17 @@ class PlaneItem(QGraphicsItem):
         path.closeSubpath()
 
         # Couleur selon l'état
-        if self.warning:
+        if self.in_storm:
+            # Clignotement en violet pour les avions dans l'orage
+            self.pulse_phase = (self.pulse_phase + 0.3) % 6.28
+            intensity = int(100 + 100 * abs(sin(self.pulse_phase)))
+            color = QColor(intensity, 50, intensity)
+        elif self.warning:
             self.pulse_phase = (self.pulse_phase + 0.2) % 6.28
             intensity = int(155 + 100 * abs(sin(self.pulse_phase)))
             color = QColor(intensity, 50, 50)
+        elif self.landing_mode:
+            color = QColor(100, 255, 100)
         elif self.selected:
             color = QColor(255, 200, 50)
         else:
@@ -138,9 +203,13 @@ class PlaneItem(QGraphicsItem):
 
         # Callsign et altitude
         text = f"{self.callsign}\n{int(self.altitude_m)}m"
+        if self.landing_mode:
+            text += "\n🛬"
         if self.fuel_percent < 30:
             text += f"\n⚠ {int(self.fuel_percent)}%"
             painter.setPen(QPen(QColor(255, 100, 100)))
+        if self.in_storm:
+            painter.setPen(QPen(QColor(255, 100, 255)))
 
         painter.drawText(18, -5, text)
 
@@ -150,6 +219,36 @@ class PlaneItem(QGraphicsItem):
             painter.drawEllipse(-20, -20, 40, 40)
 
     def advance(self, dt_sec):
+        # Mode atterrissage automatique
+        if self.landing_mode:
+            # Calculer l'angle vers la piste (centre 0,0)
+            target_angle = degrees(atan2(-self.x(), -self.y()))
+
+            # Ajuster progressivement le cap vers la cible
+            angle_diff = (target_angle - self.heading + 180) % 360 - 180
+            turn_rate = 2.0  # degrés par frame
+            if abs(angle_diff) > turn_rate:
+                self.heading += turn_rate if angle_diff > 0 else -turn_rate
+            else:
+                self.heading = target_angle
+
+            self.heading = self.heading % 360
+
+            # Descente progressive
+            if self.altitude_m > 200:
+                self.altitude_m = max(200, self.altitude_m - 20)
+
+            # Réduction de vitesse
+            if self.speed_kmh > 180:
+                self.speed_kmh = max(180, self.speed_kmh - 5)
+
+        # Perturbations dues à l'orage
+        if self.in_storm:
+            # Changements erratiques
+            self.heading = (self.heading + random.uniform(-5, 5)) % 360
+            self.speed_kmh = max(100, min(800, self.speed_kmh + random.uniform(-30, 30)))
+            self.altitude_m = max(500, min(12000, self.altitude_m + random.uniform(-50, 50)))
+
         speed_m_s = (self.speed_kmh * 1000) / 3600
         distance_pixels = (speed_m_s * dt_sec) / self.scale_m_per_pixel
 
@@ -176,6 +275,11 @@ class PlaneItem(QGraphicsItem):
         self.heading = (self.heading + random.uniform(-60, 60)) % 360
         self.speed_kmh = max(80, min(800, self.speed_kmh + random.uniform(-120, 120)))
 
+    def start_landing(self):
+        """Active le mode atterrissage automatique"""
+        self.landing_mode = True
+        self.update()
+
 
 # ---- Scene radar améliorée ----
 class RadarScene(QGraphicsScene):
@@ -183,6 +287,7 @@ class RadarScene(QGraphicsScene):
         super().__init__(-radius, -radius, radius * 2, radius * 2)
         self.radius = radius
         self.planes = []
+        self.storms = []
         self.sweep_angle = 0.0
         self.landing_zone = LandingZoneItem()
         self.addItem(self.landing_zone)
@@ -197,6 +302,23 @@ class RadarScene(QGraphicsScene):
             self.planes.remove(plane)
             self.removeItem(plane)
 
+    def add_storm(self):
+        """Ajoute un orage à une position aléatoire"""
+        angle = random.uniform(0, 360)
+        r = random.uniform(100, self.radius - 100)
+        x = cos(radians(angle)) * r
+        y = sin(radians(angle)) * r
+
+        storm = StormItem(x, y)
+        self.storms.append(storm)
+        self.addItem(storm)
+        return storm
+
+    def remove_storm(self, storm: StormItem):
+        if storm in self.storms:
+            self.storms.remove(storm)
+            self.removeItem(storm)
+
     def advance_simulation(self, dt_sec):
         events = []
         planes_to_remove = []
@@ -204,6 +326,14 @@ class RadarScene(QGraphicsScene):
         for p in list(self.planes):
             p.advance(dt_sec)
             p.warning = False
+            p.in_storm = False
+
+            # Vérifier si l'avion est dans un orage
+            for storm in self.storms:
+                if storm.affects_plane(p.pos()):
+                    p.in_storm = True
+                    events.append(('storm', p))
+                    break
 
             # Vérifier si dans zone d'atterrissage
             if abs(p.x()) < LANDING_ZONE_SIZE / 2 and abs(p.y()) < LANDING_ZONE_SIZE / 2:
@@ -264,14 +394,15 @@ class RadarScene(QGraphicsScene):
             y = sin(ang) * self.radius
             painter.drawLine(center, QPointF(x, y))
 
-            # Labels d'angle
+            # Labels d'angle - NORD EN HAUT (270° = N)
             if a % 90 == 0:
                 painter.setPen(QPen(QColor(100, 200, 255)))
                 font = QFont("Arial", 10, QFont.Bold)
                 painter.setFont(font)
                 tx = cos(ang) * (self.radius - 30)
                 ty = sin(ang) * (self.radius - 30)
-                directions = {0: "N", 90: "E", 180: "S", 270: "O"}
+                # Correction: 270° = N, 0° = E, 90° = S, 180° = O
+                directions = {270: "N", 0: "E", 90: "S", 180: "O"}
                 painter.drawText(QPointF(tx - 10, ty + 5), directions.get(a, ""))
                 painter.setPen(QPen(QColor(0, 80, 120, 60), 1))
 
@@ -379,6 +510,23 @@ class ControlPanel(QWidget):
         form.addRow(self.land_btn)
 
         layout.addWidget(card)
+
+        # Contrôle des orages
+        storm_card = QGroupBox("⚡ Gestion Météo")
+        storm_layout = QVBoxLayout()
+        storm_card.setLayout(storm_layout)
+
+        self.storm_btn = QPushButton("🌩️ Créer Orage")
+        self.clear_storms_btn = QPushButton("☀️ Dissiper Orages")
+
+        storm_layout.addWidget(self.storm_btn)
+        storm_layout.addWidget(self.clear_storms_btn)
+
+        self.storm_count_label = QLabel("Orages actifs: 0")
+        self.storm_count_label.setStyleSheet("font-size: 12px; padding: 5px;")
+        storm_layout.addWidget(self.storm_count_label)
+
+        layout.addWidget(storm_card)
 
         # Statistiques
         stats = QGroupBox("📊 Statistiques")
@@ -512,6 +660,8 @@ class MainWindow(QWidget):
         self.controls.apply_btn.clicked.connect(self.apply_controls)
         self.controls.deviate_btn.clicked.connect(self.force_deviate)
         self.controls.land_btn.clicked.connect(self.initiate_landing)
+        self.controls.storm_btn.clicked.connect(self.create_storm)
+        self.controls.clear_storms_btn.clicked.connect(self.clear_storms)
 
         # État
         self.timer = QTimer()
@@ -524,12 +674,15 @@ class MainWindow(QWidget):
         self.landings = 0
 
         # Avions initiaux
-        self.create_random_planes(6)
+        self.create_random_planes(TARGET_PLANE_COUNT)
 
-        # Timer pour ajouter des avions
+        # Timer pour ajouter des avions toutes les 20s
         self.spawn_timer = QTimer()
         self.spawn_timer.timeout.connect(self.spawn_plane)
-        self.spawn_timer.start(15000)  # Nouvel avion toutes les 15s
+        self.spawn_timer.start(20000)  # 20 secondes
+
+        # Timer pour dissiper les orages après 30 secondes
+        self.storm_timers = []
 
     def create_random_callsign(self):
         prefix = random.choice(["AF", "LH", "BA", "EZY", "DLH", "RYR", "UAE"])
@@ -554,8 +707,43 @@ class MainWindow(QWidget):
             self.controls.plane_list.addItem(p.callsign)
 
     def spawn_plane(self):
-        if len(self.scene.planes) < 15:
+        """Ajoute un nouvel avion si nécessaire pour maintenir environ 5 avions"""
+        if len(self.scene.planes) < TARGET_PLANE_COUNT:
             self.create_random_planes(1)
+
+    def create_storm(self):
+        """Crée un nouvel orage"""
+        storm = self.scene.add_storm()
+        self.update_storm_count()
+
+        # Timer pour dissiper l'orage après 30 secondes
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: self.remove_storm(storm))
+        timer.start(30000)  # 30 secondes
+        self.storm_timers.append(timer)
+
+        QMessageBox.information(self, "Orage détecté",
+                                "⚡ Un orage s'est formé sur le radar!\n"
+                                "Les avions dans la zone seront perturbés.")
+
+    def remove_storm(self, storm):
+        """Dissipe un orage"""
+        self.scene.remove_storm(storm)
+        self.update_storm_count()
+
+    def clear_storms(self):
+        """Dissipe tous les orages"""
+        for storm in list(self.scene.storms):
+            self.scene.remove_storm(storm)
+        self.storm_timers.clear()
+        self.update_storm_count()
+        QMessageBox.information(self, "Météo", "☀️ Tous les orages ont été dissipés.")
+
+    def update_storm_count(self):
+        """Met à jour le compteur d'orages"""
+        count = len(self.scene.storms)
+        self.controls.storm_count_label.setText(f"Orages actifs: {count}")
 
     def tick(self):
         dt = self.last_dt
@@ -583,6 +771,17 @@ class MainWindow(QWidget):
             elif event[0] == 'fuel_low':
                 _, plane = event
                 print(f"⚠ Carburant faible: {plane.callsign}")
+            elif event[0] == 'storm':
+                _, plane = event
+                # Message seulement une fois par avion
+                if not hasattr(plane, '_storm_warned'):
+                    plane._storm_warned = True
+                    print(f"⚡ {plane.callsign} traverse un orage!")
+
+        # Réinitialiser les avertissements d'orage pour les avions hors orage
+        for p in self.scene.planes:
+            if not p.in_storm and hasattr(p, '_storm_warned'):
+                delattr(p, '_storm_warned')
 
         self.controls.events_label.setText(f"Alertes: {self.events_count}")
         self.controls.landed_label.setText(f"Atterrissages: {self.landings}")
@@ -645,12 +844,15 @@ class MainWindow(QWidget):
 
         p = self.find_plane_by_callsign(cs)
         if p:
-            # Orienter vers la piste
-            p.change_altitude(300)
-            p.change_speed(200)
-            QMessageBox.information(self, "Atterrissage",
-                                    f"{p.callsign} autorisé à atterrir.\n"
-                                    f"Guidez-le vers la zone centrale.")
+            if p.landing_mode:
+                QMessageBox.information(self, "Atterrissage",
+                                        f"{p.callsign} est déjà en approche finale.")
+            else:
+                p.start_landing()
+                QMessageBox.information(self, "Atterrissage",
+                                        f"✓ {p.callsign} passe en mode atterrissage automatique.\n"
+                                        f"L'avion va se diriger automatiquement vers la piste,\n"
+                                        f"descendre à 200m et réduire sa vitesse à 180 km/h.")
 
 
 # ---- Exécution ----
@@ -659,4 +861,3 @@ if __name__ == '__main__':
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
-
