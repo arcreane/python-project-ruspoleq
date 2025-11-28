@@ -1,506 +1,382 @@
-# -----------------------------
-# MODÈLE : Aircraft (dataclass)
-# -----------------------------
+"""
+Radar Simulator - PySide6
+Single-file example implementing:
+- Radar display with sweeping green beam
+- Planes represented by simple drawn icons
+- Continuous simulation of plane movement (heading, speed, altitude)
+- Selection of planes and controls to change heading/speed/altitude
+- "Dévier" button to force a deviation in trajectory
+- Collision proximity detection and simple gamification counters
 
-@dataclass
-class Aircraft:
-    id: str
-    x: float
-    y: float
-    altitude: float
-    speed: float
-    heading: float
-    fuel: float
-    status: str = "normal"
-    color: QColor = field(default_factory=lambda: QColor.fromHsv(random.randint(0,359), 200, 255))
-    target_altitude: Optional[float] = None
-    emergency: bool = False
-    fuel_leak: bool = False
-    engine_failure: bool = False
-    weather_delay: bool = False
+Requirements:
+- Python 3.12
+- PySide6
 
-    landing_timer: float = 0.0
-    descent_speed: float = 5.0   # vitesse de descente verticale en atterrissage (m/s)
+Run:
+python radar_simulator.py
 
-    def update(self, dt):
-        # consommation de carburant (lente mais toujours présente)
-        if self.fuel > 0:
-            self.fuel -= dt * (0.01 if not self.fuel_leak else 0.03)
-        if self.fuel <= 0 and self.status != "landing":
-            self.status = "landing"
+This is a simplified but extensible prototype intended for the IPSA project.
+"""
 
-        # si carburant très bas → forcer atterrissage
-        if self.fuel <= 10 and self.status != "landing":
-            self.status = "landing"
+from math import sin, cos, radians, atan2, degrees, sqrt
+import random
+import sys
+from PySide6.QtCore import (QPointF, QRectF, Qt, QTimer)
+from PySide6.QtGui import (QBrush, QColor, QPainter, QPainterPath, QPen)
+from PySide6.QtWidgets import (QApplication, QGraphicsItem, QGraphicsScene,
+                               QGraphicsView, QHBoxLayout, QLabel, QVBoxLayout,
+                               QWidget, QPushButton, QFormLayout, QSpinBox,
+                               QSlider, QListWidget, QListWidgetItem, QGroupBox,
+                               QLineEdit, QMessageBox)
 
-        # altitudes cibles
-        if self.target_altitude is not None:
-            if abs(self.altitude - self.target_altitude) < 50:
-                self.altitude = self.target_altitude
-                self.target_altitude = None
-            elif self.altitude < self.target_altitude:
-                self.altitude += dt * 300
-            else:
-                self.altitude -= dt * 300
+# ---- Constants ----
+RADAR_RADIUS = 400
+UPDATE_INTERVAL_MS = 40  # 25 fps
+SWEEP_SPEED_DEG_PER_SEC = 90  # degrees per second
+PROXIMITY_THRESHOLD = 30  # pixels for 'near collision'
 
-        # effet météo (ralentissement)
-        effective_speed = self.speed * (0.7 if self.weather_delay else 1.0)
+# ---- Utility functions ----
 
-        # gestion de l’atterrissage
-        if self.status == "landing":
-            # réduire la vitesse (km/h)
-            if self.speed > MIN_LANDING_SPEED:
-                self.speed -= dt * 20
-            else:
-                self.speed = MIN_LANDING_SPEED
-
-            # descente plus rapide (m/s)
-            if self.altitude > 0:
-                self.altitude -= dt * self.descent_speed
-                if self.altitude <= 0:
-                    self.altitude = 0
-                    self.speed = 0
-                    self.status = "landed"
-
-        # attente (holding)
-        if self.status == "holding":
-            self.heading += dt * 8
-            self.heading %= 360
-
-        # panne moteur
-        if self.engine_failure:
-            effective_speed *= 0.5
-
-        # déplacement selon cap + vitesse
-        distance = effective_speed * (dt / 3600)
-        heading_rad = math.radians(90 - self.heading)
-        dx = distance * math.cos(heading_rad)
-        dy = distance * math.sin(heading_rad)
-        self.x += dx
-        self.y += dy
-
-    # -------------------------
-    # COMMANDES UTILISATEUR
-    # -------------------------
-    def set_heading(self, heading):
-        self.heading = heading % 360
-
-    def climb(self):
-        if self.altitude < MAX_ALTITUDE:
-            self.target_altitude = min(self.altitude + 1000, MAX_ALTITUDE)
-
-    def descend(self):
-        if self.altitude > 0:
-            self.target_altitude = max(self.altitude - 1000, 0)
-        if self.target_altitude == 0:
-            self.status = "landing"
-
-    def hold(self):
-        self.status = "holding"
-
-    def authorize_landing(self):
-        self.status = "landing"
-
-    def go_around(self):
-        if self.status != "landed":
-            self.status = "normal"
-            self.altitude += 800
-            self.speed = max(self.speed, 300)
+def project_move(x, y, heading_deg, distance):
+    # heading: 0 = up (north), 90 = right (east)
+    angle = radians(-heading_deg + 90)
+    nx = x + cos(angle) * distance
+    ny = y + sin(angle) * distance
+    return nx, ny
 
 
-# -----------------------------
-# SIMULATION
-# -----------------------------
+def distance(a: QPointF, b: QPointF):
+    return sqrt((a.x() - b.x()) ** 2 + (a.y() - b.y()) ** 2)
 
-class Simulation(QObject):
-    aircraft_added = Signal(Aircraft)
-    aircraft_removed = Signal(str)
-    aircraft_updated = Signal(Aircraft)
-    collision_signal = Signal(str, str)
-    score_updated = Signal(int)
-    event_signal = Signal(str)
+# ---- Plane graphical item ----
 
-    emergency_signal = Signal(Aircraft)
-
-    def __init__(self):
+class PlaneItem(QGraphicsItem):
+    def __init__(self, callsign: str, x: float, y: float,
+                 heading: float, speed_kmh: float, altitude_m: float):
         super().__init__()
-        self.aircraft_list: List[Aircraft] = []
-        self.score = 0
-        self.last_update = time.time()
+        self.callsign = callsign
+        self.setPos(x, y)
+        self.heading = heading  # degrees
+        self.speed_kmh = speed_kmh
+        self.altitude_m = altitude_m
+        self.selected = False
+        self.setFlag(QGraphicsItem.ItemIsSelectable)
+        self.setFlag(QGraphicsItem.ItemSendsGeometryChanges)
 
-        self.timer = QTimer()
-        self.timer.setInterval(200)  # cycle simulation 200ms
-        self.timer.timeout.connect(self.update_simulation)
+        # Derived attribute: pixels per second speed (approx)
+        # assume radar scale: 1 pixel = 10 meters (arbitrary, tuneable)
+        self.scale_m_per_pixel = 10
 
-        self.spawn_timer = QTimer()
-        self.spawn_timer.setInterval(15000)  # apparition lente : 15s
-        self.spawn_timer.timeout.connect(self.spawn_aircraft)
+    def boundingRect(self) -> QRectF:
+        return QRectF(-12, -12, 24, 24)
 
-        self.event_timer = QTimer()
-        self.event_timer.setInterval(20000)  # événements toutes les 20s
-        self.event_timer.timeout.connect(self.random_event)
-
-    def start(self):
-        self.last_update = time.time()
-        self.timer.start()
-        self.spawn_timer.start()
-        self.event_timer.start()
-
-    def update_simulation(self):
-        now = time.time()
-        dt = now - self.last_update
-        self.last_update = now
-
-        # mise à jour des avions
-        for ac in self.aircraft_list:
-            ac.update(dt)
-            self.aircraft_updated.emit(ac)
-
-        # détection des collisions
-        to_remove = set()
-        for i in range(len(self.aircraft_list)):
-            for j in range(i + 1, len(self.aircraft_list)):
-                a = self.aircraft_list[i]
-                b = self.aircraft_list[j]
-
-                dx = a.x - b.x
-                dy = a.y - b.y
-                distance = math.sqrt(dx * dx + dy * dy)
-
-                if distance < 0.08 and abs(a.altitude - b.altitude) < 50:
-                    self.collision_signal.emit(a.id, b.id)
-                    to_remove.add(a)
-                    to_remove.add(b)
-
-                elif distance < 0.3 and abs(a.altitude - b.altitude) < 150:
-                    self.event(f"Quasi-collision entre {a.id} et {b.id}")
-                    a.heading += 10
-                    b.heading -= 10
-
-        for ac in to_remove:
-            if ac in self.aircraft_list:
-                self.aircraft_list.remove(ac)
-                self.aircraft_removed.emit(ac.id)
-
-        # score (avion atterri)
-        landed_now = [ac for ac in self.aircraft_list if ac.status == "landed"]
-        for ac in landed_now:
-            self.score += 1
-            self.score_updated.emit(self.score)
-            self.aircraft_list.remove(ac)
-            self.aircraft_removed.emit(ac.id)
-            self.event(f"{ac.id} a atterri (+1 point)")
-
-    def spawn_aircraft(self):
-        # apparition sur les bords, altitude <= 1000m
-        edge = random.choice(["N", "S", "E", "W"])
-        if edge == "N":
-            x = random.uniform(-10, 10)
-            y = -12
-            heading = random.uniform(160, 200)
-        elif edge == "S":
-            x = random.uniform(-10, 10)
-            y = 12
-            heading = random.uniform(-20, 20)
-        elif edge == "E":
-            x = 12
-            y = random.uniform(-10, 10)
-            heading = random.uniform(250, 290)
-        else:
-            x = -12
-            y = random.uniform(-10, 10)
-            heading = random.uniform(70, 110)
-
-        altitude = random.uniform(300, 1000)
-        speed = random.uniform(250, 450)
-        aircraft_id = random.choice(["AF", "LH", "EK", "BA"]) + str(random.randint(100, 9999))
-
-        ac = Aircraft(
-            id=aircraft_id,
-            x=x,
-            y=y,
-            altitude=altitude,
-            speed=speed,
-            heading=heading,
-            fuel=random.uniform(30, 100),
-        )
-
-        self.aircraft_list.append(ac)
-        self.aircraft_added.emit(ac)
-        self.event(f"{ac.id} est apparu (alt {int(ac.altitude)}m)")
-
-    def random_event(self):
-        if not self.aircraft_list:
-            return
-        ac = random.choice(self.aircraft_list)
-        r = random.random()
-
-        if r < 0.3:  # panne moteur
-            ac.engine_failure = True
-            ac.fuel *= 0.7
-            ac.speed *= 0.7
-            ac.status = "landing"
-            self.event(f"Panne moteur : {ac.id}")
-
-        elif r < 0.6:  # météo
-            for x in random.sample(self.aircraft_list, min(3, len(self.aircraft_list))):
-                x.status = "holding"
-                x.weather_delay = True
-            self.event("Mauvais temps : plusieurs avions mis en attente")
-
-        elif r < 0.8:  # remise de gaz
-            ac.go_around()
-            self.event(f"Remise de gaz : {ac.id}")
-
-        else:  # risque de collision
-            if len(self.aircraft_list) >= 2:
-                a, b = random.sample(self.aircraft_list, 2)
-                a.heading += 5
-                b.heading -= 5
-                self.event(f"Risque de collision entre {a.id} et {b.id}")
-
-    def event(self, text):
-        self.event_signal.emit(f"[{time.strftime('%H:%M:%S')}] {text}")
-
-
-# -----------------------------
-# UI : éléments graphiques
-# -----------------------------
-class AircraftItem(QGraphicsItem):
-    def __init__(self, aircraft: Aircraft, scale=1000):
-        super().__init__()
-        self.aircraft = aircraft
-        self.scale = scale
-        self.setZValue(5)
-
-    def boundingRect(self):
-        return QRectF(-10, -10, 120, 40)
-
-    def paint(self, painter, option, widget=None):
+    def paint(self, painter: QPainter, option, widget=None):
+        # Draw aircraft icon (triangle with tail)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.save()
+        painter.rotate(-self.heading)  # rotate icon to match heading
 
-        # rotation selon cap
-        painter.rotate(-self.aircraft.heading)
+        # body
+        path = QPainterPath()
+        path.moveTo(0, -10)
+        path.lineTo(6, 8)
+        path.lineTo(0, 4)
+        path.lineTo(-6, 8)
+        path.closeSubpath()
 
-        # dessin du point représentant l'avion
-        painter.setBrush(self.aircraft.color)
-        painter.drawEllipse(-6, -6, 12, 12)
+        painter.setBrush(QBrush(QColor(200, 200, 255)))
+        painter.setPen(QPen(QColor(180, 180, 220), 1))
+        painter.drawPath(path)
+
+        # contrail / heading indicator
+        painter.setPen(QPen(QColor(100, 255, 100), 1, Qt.DashLine))
+        painter.drawLine(0, -10, 0, -30)
 
         painter.restore()
 
-        # texte à droite de l’avion
-        info = f"{self.aircraft.id} | Alt {int(self.aircraft.altitude)}m | V {int(self.aircraft.speed)}"
-        painter.drawText(10, 0, info)
+        # Draw callsign and altitude
+        painter.setPen(QPen(Qt.white))
+        painter.drawText(14, 0, f"{self.callsign} ({int(self.altitude_m)}m)")
 
+        if self.isSelected():
+            painter.setPen(QPen(Qt.yellow, 1))
+            painter.drawEllipse(-16, -16, 32, 32)
 
-# -----------------------------
-# FENÊTRE PRINCIPALE
-# -----------------------------
+    def advance(self, dt_sec):
+        # speed_kmh -> m/s
+        speed_m_s = (self.speed_kmh * 1000) / 3600
+        # convert to pixels using scale
+        distance_pixels = (speed_m_s * dt_sec) / self.scale_m_per_pixel
+        x, y = self.x(), self.y()
+        nx, ny = project_move(x, y, self.heading, distance_pixels)
+        self.setPos(nx, ny)
 
-class MainWindow(QMainWindow):
+    def change_heading(self, new_heading_deg):
+        self.heading = new_heading_deg % 360
+        self.update()
+
+    def change_speed(self, new_speed_kmh):
+        self.speed_kmh = max(50, new_speed_kmh)
+
+    def change_altitude(self, new_alt_m):
+        self.altitude_m = max(0, new_alt_m)
+
+    def deviate_randomly(self):
+        # small random offset to heading and speed
+        self.heading = (self.heading + random.uniform(-60, 60)) % 360
+        self.speed_kmh = max(80, self.speed_kmh + random.uniform(-120, 120))
+
+# ---- Radar scene ----
+
+class RadarScene(QGraphicsScene):
+    def __init__(self, radius: int):
+        super().__init__(-radius, -radius, radius * 2, radius * 2)
+        self.radius = radius
+        self.planes = []
+        self.sweep_angle = 0.0  # degrees
+        self.elapsed_acc = 0.0
+
+        # background grid lines / circles
+        self.setBackgroundBrush(QBrush(QColor(10, 30, 10)))
+
+    def add_plane(self, plane: PlaneItem):
+        self.planes.append(plane)
+        self.addItem(plane)
+
+    def remove_plane(self, plane: PlaneItem):
+        if plane in self.planes:
+            self.planes.remove(plane)
+            self.removeItem(plane)
+
+    def advance_simulation(self, dt_sec):
+        # Move planes
+        for p in list(self.planes):
+            p.advance(dt_sec)
+
+        # detect proximity
+        events = []
+        for i in range(len(self.planes)):
+            for j in range(i + 1, len(self.planes)):
+                d = distance(self.planes[i].pos(), self.planes[j].pos())
+                if d < PROXIMITY_THRESHOLD:
+                    events.append((self.planes[i], self.planes[j], d))
+        return events
+
+    def drawBackground(self, painter: QPainter, rect: QRectF):
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        center = QPointF(0, 0)
+
+        # outer circle
+        painter.setPen(QPen(QColor(0, 120, 0), 2))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(center, self.radius, self.radius)
+
+        # range rings
+        painter.setPen(QPen(QColor(0, 80, 0), 1))
+        for r in range(int(self.radius / 4), self.radius, int(self.radius / 4)):
+            painter.drawEllipse(center, r, r)
+
+        # radial lines
+        painter.setPen(QPen(QColor(0, 60, 0), 1))
+        for a in range(0, 360, 30):
+            ang = radians(a)
+            x = cos(ang) * self.radius
+            y = sin(ang) * self.radius
+            painter.drawLine(center, QPointF(x, y))
+
+        # sweep effect: a translucent green pie sector
+        gradient_color = QColor(80, 255, 80, 60)
+        painter.setBrush(QBrush(gradient_color))
+        painter.setPen(Qt.NoPen)
+        # draw a sector spanning 8 degrees behind sweep angle
+        span_deg = 12
+        start_angle = -self.sweep_angle - span_deg
+        path = QPainterPath()
+        path.moveTo(center)
+        path.arcTo(-self.radius, -self.radius, self.radius * 2, self.radius * 2,
+                   start_angle, span_deg)
+        path.closeSubpath()
+        painter.drawPath(path)
+
+        # center crosshair
+        painter.setPen(QPen(QColor(60, 255, 60), 1))
+        painter.drawLine(0, -10, 0, 10)
+        painter.drawLine(-10, 0, 10, 0)
+
+        painter.restore()
+
+# ---- Main Window & Controls ----
+
+class ControlPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+
+        # Plane list
+        self.plane_list = QListWidget()
+        layout.addWidget(QLabel("Avions dans l'espace aérien"))
+        layout.addWidget(self.plane_list)
+
+        # Info / controls
+        card = QGroupBox("Contrôles avion sélectionné")
+        form = QFormLayout()
+        card.setLayout(form)
+
+        self.callsign_label = QLabel("Aucun")
+        form.addRow("Sélection:", self.callsign_label)
+
+        self.heading_spin = QSpinBox(); self.heading_spin.setRange(0, 359)
+        form.addRow("Cap (°):", self.heading_spin)
+
+        self.speed_spin = QSpinBox(); self.speed_spin.setRange(50, 900)
+        form.addRow("Vitesse (km/h):", self.speed_spin)
+
+        self.alt_spin = QSpinBox(); self.alt_spin.setRange(0, 15000)
+        form.addRow("Altitude (m):", self.alt_spin)
+
+        self.apply_btn = QPushButton("Appliquer")
+        self.deviate_btn = QPushButton("Dévier")
+        form.addRow(self.apply_btn, self.deviate_btn)
+
+        layout.addWidget(card)
+
+        # Gamification / stats
+        stats = QGroupBox("Statistiques")
+        v = QVBoxLayout(); stats.setLayout(v)
+        self.score_label = QLabel("Score: 0")
+        self.events_label = QLabel("Événements: 0")
+        v.addWidget(self.score_label)
+        v.addWidget(self.events_label)
+        layout.addWidget(stats)
+
+        layout.addStretch()
+
+# ---- Main application ----
+
+class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Simulateur ATC – Version Française")
-        self.resize(1300, 800)
+        self.setWindowTitle("Simulateur de tour de contrôle - Radar")
+        self.resize(1100, 850)
 
-        self.sim = Simulation()
-        self.aircraft_refs = {}
-
-        container = QWidget()
-        layout = QHBoxLayout(container)
-        layout.setContentsMargins(0,0,0,0)
-        self.setCentralWidget(container)
-
-        # -------------------------
-        # PANNEAU GAUCHE
-        # -------------------------
-        left_panel = QVBoxLayout()
-        left_panel.setContentsMargins(20,20,20,20)
-
-        self.score_label = QLabel("Score : 0")
-        self.score_label.setStyleSheet("font-size: 18px; font-weight: bold; color: white;")
-
-        self.event_list = QListWidget()
-        self.event_list.setStyleSheet("background: rgba(0,0,0,0.4); color: white;")
-
-        self.aircraft_list = QListWidget()
-        self.aircraft_list.setStyleSheet("background: rgba(0,0,0,0.4); color: white;")
-
-        left_panel.addWidget(self.score_label)
-        left_panel.addWidget(QLabel("Événements :"))
-        left_panel.addWidget(self.event_list)
-        left_panel.addWidget(QLabel("Avions actifs :"))
-        left_panel.addWidget(self.aircraft_list)
-
-        left_widget = QWidget()
-        left_widget.setLayout(left_panel)
-        left_widget.setFixedWidth(320)
-        layout.addWidget(left_widget)
-
-        # -------------------------
-        # RADAR
-        # -------------------------
-        self.scene = QGraphicsScene(-15000, -15000, 30000, 30000)
+        self.scene = RadarScene(RADAR_RADIUS)
         self.view = QGraphicsView(self.scene)
-        self.view.setRenderHint(QPainter.Antialiasing)
+        self.view.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
+        self.view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.view.setFixedSize(RADAR_RADIUS * 2 + 4, RADAR_RADIUS * 2 + 4)
 
-        try:
-            pix = QPixmap("assets/radar_background.jpg")
-            if pix.isNull():
-                self.view.setStyleSheet("background: black;")
-            else:
-                self.view.setBackgroundBrush(pix.scaled(1300,800, Qt.KeepAspectRatioByExpanding))
-        except:
-            self.view.setStyleSheet("background: black;")
+        self.controls = ControlPanel()
 
-        layout.addWidget(self.view, stretch=5)
+        h = QHBoxLayout()
+        h.addWidget(self.view)
+        h.addWidget(self.controls)
+        self.setLayout(h)
 
-        # -------------------------
-        # PANNEAU DROIT (COMMANDES)
-        # -------------------------
-        right_panel = QVBoxLayout()
-        right_panel.setContentsMargins(20,20,20,20)
+        # Connect signals
+        self.controls.plane_list.currentItemChanged.connect(self.on_plane_selected)
+        self.controls.apply_btn.clicked.connect(self.apply_controls)
+        self.controls.deviate_btn.clicked.connect(self.force_deviate)
 
-        self.selected_label = QLabel("Aucun avion sélectionné")
-        right_panel.addWidget(self.selected_label)
+        # Simulation state
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(UPDATE_INTERVAL_MS)
 
-        # boutons
-        self.btn_climb = QPushButton("Monter")
-        self.btn_descend = QPushButton("Descendre")
-        self.btn_hold = QPushButton("Attente")
-        self.btn_land = QPushButton("Autoriser atterrissage")
-        self.btn_go_around = QPushButton("Remise de gaz")
+        self.last_dt = UPDATE_INTERVAL_MS / 1000.0
+        self.score = 0
+        self.events = 0
 
-        # cap
-        right_panel.addWidget(QLabel("Changer cap :"))
-        self.heading_input = QLineEdit()
-        self.heading_input.setPlaceholderText("0–359°")
-        self.btn_heading = QPushButton("Appliquer cap")
+        # seed a few planes
+        self.create_random_planes(6)
 
-        for btn in [
-            self.btn_climb, self.btn_descend, self.btn_hold,
-            self.btn_land, self.btn_go_around,
-            self.heading_input, self.btn_heading
-        ]:
-            right_panel.addWidget(btn)
+    def create_random_callsign(self):
+        prefix = random.choice(["AF", "LH", "BA", "AFR", "EZY", "DLH"])
+        num = random.randint(100, 9999)
+        return f"{prefix}{num}"
 
-        right_panel.addStretch()
-        right_widget = QWidget()
-        right_widget.setFixedWidth(300)
-        right_widget.setLayout(right_panel)
-        layout.addWidget(right_widget)
+    def create_random_planes(self, n=5):
+        for _ in range(n):
+            angle = random.uniform(0, 360)
+            r = random.uniform(50, RADAR_RADIUS - 50)
+            x = cos(radians(angle)) * r
+            y = sin(radians(angle)) * r
+            p = PlaneItem(self.create_random_callsign(), x, y,
+                          heading=random.uniform(0, 360),
+                          speed_kmh=random.uniform(200, 700),
+                          altitude_m=random.uniform(1000, 9000))
+            self.scene.add_plane(p)
+            self.controls.plane_list.addItem(p.callsign)
 
-        ###################################
-        # Connexions signaux → UI
-        ###################################
-        self.sim.aircraft_added.connect(self.add_aircraft)
-        self.sim.aircraft_removed.connect(self.remove_aircraft)
-        self.sim.aircraft_updated.connect(self.update_aircraft)
-        self.sim.collision_signal.connect(self.on_collision)
-        self.sim.score_updated.connect(self.update_score)
-        self.sim.event_signal.connect(self.on_event)
+    def tick(self):
+        dt = self.last_dt
+        # advance sweep
+        self.scene.sweep_angle = (self.scene.sweep_angle + SWEEP_SPEED_DEG_PER_SEC * dt) % 360
+        # advance simulation
+        events = self.scene.advance_simulation(dt)
+        if events:
+            self.events += len(events)
+            self.controls.events_label.setText(f"Événements: {self.events}")
+            # Show warning for near collisions
+            for a, b, d in events:
+                print(f"Proximité: {a.callsign} - {b.callsign} (d={d:.1f})")
+        # refresh view
+        self.scene.update()
 
-        self.aircraft_list.itemSelectionChanged.connect(self.on_selection_changed)
+    def find_plane_by_callsign(self, callsign: str):
+        for p in self.scene.planes:
+            if p.callsign == callsign:
+                return p
+        return None
 
-        # commandes
-        self.btn_climb.clicked.connect(lambda: self.issue_command("climb"))
-        self.btn_descend.clicked.connect(lambda: self.issue_command("descend"))
-        self.btn_hold.clicked.connect(lambda: self.issue_command("hold"))
-        self.btn_land.clicked.connect(lambda: self.issue_command("land"))
-        self.btn_go_around.clicked.connect(lambda: self.issue_command("go_around"))
-        self.btn_heading.clicked.connect(lambda: self.issue_command("heading"))
-
-        self.sim.start()
-
-    ###################################
-    # Mise à jour de l'UI
-    ###################################
-
-    def add_aircraft(self, ac):
-        item = AircraftItem(ac)
-        self.scene.addItem(item)
-        self.aircraft_refs[ac.id] = item
-
-        list_item = QListWidgetItem(ac.id)
-        self.aircraft_list.addItem(list_item)
-
-    def remove_aircraft(self, aircraft_id):
-        if aircraft_id in self.aircraft_refs:
-            item = self.aircraft_refs.pop(aircraft_id)
-            self.scene.removeItem(item)
-
-        for i in range(self.aircraft_list.count()):
-            if self.aircraft_list.item(i).text() == aircraft_id:
-                self.aircraft_list.takeItem(i)
-                break
-
-    def update_aircraft(self, ac):
-        item = self.aircraft_refs.get(ac.id)
-        if item:
-            item.setPos(ac.x * 1000, ac.y * 1000)
-            item.update()
-
-    def on_event(self, text):
-        self.event_list.insertItem(0, text)
-
-    def on_collision(self, a, b):
-        QMessageBox.critical(self, "Collision", f"{a} et {b} sont entrés en collision !")
-        self.on_event(f"Collision entre {a} et {b}")
-
-    def update_score(self, sc):
-        self.score_label.setText(f"Score : {sc}")
-
-    def on_selection_changed(self):
-        items = self.aircraft_list.selectedItems()
-        if not items:
-            self.selected_label.setText("Aucun avion sélectionné")
+    def on_plane_selected(self, current: QListWidgetItem, previous: QListWidgetItem):
+        if current is None:
             return
-        ac = items[0].text()
-        self.selected_label.setText(f"Avion sélectionné : {ac}")
+        cs = current.text()
+        p = self.find_plane_by_callsign(cs)
+        if p:
+            # set selection in scene
+            for other in self.scene.planes:
+                other.setSelected(False)
+            p.setSelected(True)
+            self.controls.callsign_label.setText(p.callsign)
+            self.controls.heading_spin.setValue(int(p.heading))
+            self.controls.speed_spin.setValue(int(p.speed_kmh))
+            self.controls.alt_spin.setValue(int(p.altitude_m))
 
-    ###################################
-    # COMMANDES UTILISATEUR
-    ###################################
-    def issue_command(self, cmd):
-        items = self.aircraft_list.selectedItems()
-        if not items:
+    def apply_controls(self):
+        cs = self.controls.callsign_label.text()
+        if cs == "Aucun":
+            QMessageBox.warning(self, "Aucun avion", "Sélectionnez d'abord un avion.")
             return
+        p = self.find_plane_by_callsign(cs)
+        if p:
+            p.change_heading(self.controls.heading_spin.value())
+            p.change_speed(self.controls.speed_spin.value())
+            p.change_altitude(self.controls.alt_spin.value())
+            self.score += 1
+            self.controls.score_label.setText(f"Score: {self.score}")
 
-        ac_id = items[0].text()
-        ac = next((x for x in self.sim.aircraft_list if x.id == ac_id), None)
-
-        if not ac:
+    def force_deviate(self):
+        cs = self.controls.callsign_label.text()
+        if cs == "Aucun":
+            QMessageBox.information(self, "Aucun avion", "Sélectionnez d'abord un avion.")
             return
+        p = self.find_plane_by_callsign(cs)
+        if p:
+            p.deviate_randomly()
+            self.controls.heading_spin.setValue(int(p.heading))
+            self.controls.speed_spin.setValue(int(p.speed_kmh))
 
-        if cmd == "climb":
-            ac.climb()
-        elif cmd == "descend":
-            ac.descend()
-        elif cmd == "hold":
-            ac.hold()
-        elif cmd == "land":
-            ac.authorize_landing()
-        elif cmd == "go_around":
-            ac.go_around()
-        elif cmd == "heading":
-            try:
-                heading = int(self.heading_input.text())
-                ac.set_heading(heading)
-            except:
-                pass
+# ---- Run ----
 
-
-# -----------------------------
-# FONCTION PRINCIPALE
-# -----------------------------
-
-def main():
-    app = QApplication([])
-    window = MainWindow()
-    window.show()
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()
